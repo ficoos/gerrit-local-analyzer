@@ -1,0 +1,48 @@
+#!/usr/bin/python
+
+import sys
+import os
+import csv
+import struct
+
+
+def _get_terminal_size_linux():
+    def ioctl_GWINSZ(fd):
+        try:
+            import fcntl
+            import termios
+            cr = struct.unpack('hh',
+                               fcntl.ioctl(fd, termios.TIOCGWINSZ, '1234'))
+            return cr
+        except:
+            pass
+    cr = ioctl_GWINSZ(0) or ioctl_GWINSZ(1) or ioctl_GWINSZ(2)
+    if not cr:
+        try:
+            fd = os.open(os.ctermid(), os.O_RDONLY)
+            cr = ioctl_GWINSZ(fd)
+            os.close(fd)
+        except:
+            pass
+    if not cr:
+        try:
+            cr = (os.environ['LINES'], os.environ['COLUMNS'])
+        except:
+            return None
+    return int(cr[1]), int(cr[0])
+
+cols, rows = _get_terminal_size_linux()
+
+reader = csv.reader(sys.stdin)
+for row in reader:
+    col_width = (cols / len(row)) - 1
+    for v in row:
+        v = v.decode('utf-8')
+        col = v[:col_width]
+        if len(col) < len(v):
+            col = col[:-3] + "..."
+
+        col += " " * (col_width - len(col))
+        sys.stdout.write(col.encode('utf-8') + " ")
+
+    sys.stdout.write("\n")
