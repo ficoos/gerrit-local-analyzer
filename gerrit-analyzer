@@ -1,0 +1,452 @@
+#!/usr/bin/python
+import sqlite3
+import os
+import pwd
+import paramiko
+import re
+from gerrit import Gerrit, QueryOptions
+import argparse
+import csv
+import sys
+
+MSG_MERGE = "Change has been successfully"
+MSG_ABANDONED = "Abandoned"
+
+DEFAULT_KEY_FILE = os.path.expandvars("$HOME/.ssh/id_rsa")
+DEFAULT_PORT = 29418
+
+RE_PATCH_SET = re.compile(r'(?:Uploaded)?[pP]atch [sS]et (\d+)[:\.]')
+RE_COMMENT_NUM = re.compile(r'\((\d+) comment\)')
+RE_LABEL = re.compile(r'([\w\-]+)([\-+]\d+)')
+
+
+def create_schema(conn):
+    c = conn.cursor()
+    c.execute("PRAGMA foreign_keys = ON")
+    c.execute("""CREATE TABLE IF NOT EXISTS settings (
+                    name TEST PRIMARY KEY,
+                    value
+                )
+    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS projects (
+                    project TEXT PRIMARY KEY
+                )
+    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS branches (
+                    branch_id INTEGER PRIMARY KEY,
+                    branch TEXT,
+                    project TEXT,
+                    FOREIGN KEY (project) REFERENCES projects(project),
+                    UNIQUE (branch, project)
+                )
+    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS accounts (
+                    username TEXT PRIMARY KEY,
+                    name TEXT
+                )
+    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS emails (
+                    email TEXT PRIMARY KEY,
+                    username TEXT,
+                    UNIQUE(email, username),
+                    FOREIGN KEY (username) REFERENCES accounts(username)
+                )
+    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS statuses (
+                    status TEXT PRIMARY KEY
+                )
+    """)
+    for status in ["NEW", "DRAFT", "SUBMITTED", "MERGED", "ABANDONED"]:
+        try:
+            c.execute("INSERT INTO statuses values(?)", (status,))
+        except sqlite3.IntegrityError:
+            # Already exists in DB
+            pass
+
+    c.execute("""CREATE TABLE IF NOT EXISTS changes (
+                    number INTEGER PRIMARY KEY,
+                    change_id TEXT,
+                    branch_id INTEGER,
+                    owner TEXT,
+                    url TEXT,
+                    created_on INTEGER,
+                    closed_at INTEGER,
+                    status TEXT,
+                    FOREIGN KEY (branch_id) REFERENCES branches(branch_id),
+                    FOREIGN KEY (status) REFERENCES statuses(status),
+                    FOREIGN KEY (owner) REFERENCES emails(email)
+                )
+    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS patch_sets (
+                    revision TEXT PRIMARY KEY,
+                    change_num INTEGER,
+                    number INTEGER,
+                    uploader TEXT,
+                    author TEXT,
+                    created_on INTEGER,
+                    is_draft INTEGER,
+                    UNIQUE(change_num, number),
+                    FOREIGN KEY (change_num) REFERENCES changes(number),
+                    FOREIGN KEY (author) REFERENCES emails(email),
+                    FOREIGN KEY (uploader) REFERENCES emails(email)
+                )
+    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS messages (
+                    message_id TEXT PRIMARY KEY,
+                    timestamp INTEGER,
+                    reviewer TEXT,
+                    message TEXT,
+                    change_num INTEGER,
+                    comment_num INTEGER,
+                    patch_set_id TEXT,
+                    FOREIGN KEY (change_num) REFERENCES changes(number),
+                    FOREIGN KEY (patch_set_id)
+                        REFERENCES patch_sets(revision),
+                    FOREIGN KEY (reviewer) REFERENCES emails(email)
+                )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS label_names (
+                   name TEXT PRIMARY KEY
+                )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS labels (
+                    label_id INTEGER PRIMARY KEY,
+                    message_id TEXT,
+                    label_name TEXT,
+                    label_value INTEGER,
+                    UNIQUE(message_id, label_name),
+                    FOREIGN KEY (message_id) REFERENCES messages(message_id),
+                    FOREIGN KEY (label_name) REFERENCES label_names(name)
+                )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS files (
+                    name TEXT PRIMARY KEY
+                )
+    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS patch_set_files (
+                    file TEXT,
+                    patch_set_id TEXT,
+                    insertions INTEGER,
+                    deletions INTEGER,
+                    PRIMARY KEY (file, patch_set_id),
+                    FOREIGN KEY (file) REFERENCES files(name),
+                    FOREIGN KEY (patch_set_id) REFERENCES patch_sets(revision)
+                )
+    """)
+    c.execute("""CREATE VIEW IF NOT EXISTS master_changes AS
+                 SELECT changes.*
+                 FROM changes INNER JOIN branches ON
+                    changes.branch_id = branches.branch_id
+                 WHERE branches.branch = "master"
+    """)
+
+    conn.commit()
+
+
+def insert_branch(conn, change):
+    c = conn.cursor()
+    c.execute("""INSERT OR IGNORE INTO projects
+                    (project)
+                VALUES
+                    (:project)""", change)
+    c.execute("""INSERT OR IGNORE INTO branches
+                    (project, branch)
+                VALUES
+                    (:project, :branch)""", change)
+    c.execute("""SELECT branch_id
+                 FROM branches
+                 WHERE branch=:branch AND project=:project""", change)
+    return c.fetchone()[0]
+
+
+def insert_account(conn, account):
+    c = conn.cursor()
+    if account.get(u'username') is not None:
+        account['name'] = account.get('name', account['username'])
+        c.execute("""INSERT OR IGNORE INTO accounts
+                         (username, name)
+                     VALUES
+                         (:username, :name)
+                  """, account)
+    account['email'] = account.get('email', "unknown")
+    account['username'] = account.get('username')
+    c.execute("""INSERT OR IGNORE INTO emails
+                     (email, username)
+                 VALUES
+                     (:email, :username)
+              """, account)
+
+    return account['email']
+
+
+def insert_patch_set(conn, patch_set):
+    c = conn.cursor()
+
+    patch_set['uploader_id'] = insert_account(conn, patch_set['uploader'])
+    patch_set['author_id'] = insert_account(conn, patch_set['author'])
+    patch_set['isDraft'] = patch_set.get('isDraft', False)
+
+    c.execute("""INSERT OR IGNORE INTO patch_sets
+                 (revision, change_num, number, uploader, author, created_on,
+                  is_draft)
+                VALUES
+                    (:revision, :change_num, :number, :uploader_id, :author_id,
+                     :createdOn, :isDraft)""", patch_set)
+
+    for fattr in patch_set.get('files', []):
+        c.execute("INSERT OR IGNORE INTO files VALUES (?)", (fattr['file'],))
+        c.execute("""INSERT OR IGNORE INTO patch_set_files
+                       (file, patch_set_id, insertions, deletions)
+                   VALUES
+                       (?, ?, ?, ?)""",
+                  (fattr['file'], patch_set['revision'], fattr['insertions'],
+                   fattr['deletions']))
+
+
+def insert_change(conn, change):
+    branch = "%s::%s" % (change['project'], change['branch'])
+    if branch not in branch_cache:
+        change['branch_id'] = insert_branch(conn, change)
+
+    c = conn.cursor()
+    change['owner_id'] = insert_account(conn, change['owner'])
+    change['closed_at'] = -1
+    if change['status'] == "MERGED":
+        for message in change.get('comments', []):
+            if MSG_MERGE in message['message'].splitlines()[0]:
+                change['closed_at'] = message['timestamp']
+                break
+        else:
+            # Old versions of gerrit didn't report merges
+            change['closed_at'] = change['lastUpdated']
+
+    elif change['status'] == "ABANDONED":
+        for message in change.get('comments', []):
+            if MSG_ABANDONED in message['message'].splitlines()[0]:
+                change['closed_at'] = message['timestamp']
+                break
+        else:
+            raise Exception("No close date detected")
+
+    c.execute("""
+        REPLACE INTO changes
+            (change_id, branch_id, number, owner, url, created_on, closed_at,
+             status)
+        VALUES
+            (:id, :branch_id, :number, :owner_id, :url, :createdOn, :closed_at,
+             :status)""", change)
+    for patch_set in change.get("patchSets", []):
+        patch_set["change_num"] = change['number']
+        insert_patch_set(conn, patch_set)
+
+    for comment in change.get("comments", []):
+        comment['change_num'] = change['number']
+        insert_message(conn, comment)
+
+
+def insert_message(conn, message):
+    c = conn.cursor()
+
+    message['reviewer_id'] = insert_account(conn, message['reviewer'])
+    msg = message['message']
+    lines = msg.splitlines()
+    try:
+        patch_set_num = RE_PATCH_SET.findall(lines[0])[0]
+    except IndexError:
+        patch_set_num = -1
+
+    try:
+        message['comment_num'] = RE_COMMENT_NUM.findall(lines[2])[0]
+    except:
+        message['comment_num'] = 0
+
+    if patch_set_num == -1:
+        message['patch_set_id'] = None
+    else:
+        message['patch_set_id'] = c.execute("""SELECT revision
+                                               FROM patch_sets
+                                               WHERE change_num=? AND
+                                                     number=?""",
+                                            (message['change_num'],
+                                             patch_set_num)
+                                            ).fetchone()[0]
+    message['id'] = "%d_%s" % (message['timestamp'], message['change_num'])
+
+    c.execute("""INSERT OR IGNORE INTO messages
+                    (message_id, change_num, timestamp, reviewer, message,
+                     patch_set_id, comment_num)
+                VALUES
+                    (:id, :change_num, :timestamp, :reviewer_id, :message,
+                     :patch_set_id, :comment_num)""", message)
+
+    for label in RE_LABEL.finditer(lines[0]):
+        c.execute("INSERT OR IGNORE INTO label_names VALUES (?)",
+                  (label.group(1),))
+        c.execute("""INSERT OR IGNORE INTO labels
+                        (message_id, label_name, label_value)
+                     VALUES
+                        (?, ?, ?)""", (message['id'],
+                                       label.group(1), label.group(2)))
+
+
+branch_cache = {}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Scrape information about a gerrit project.',
+        add_help=False)
+    subparsers = parser.add_subparsers(title="actions", dest="action")
+    parser_fetch = subparsers.add_parser("fetch")
+    parser_fetch.add_argument('host', action='store',
+                              help='hostname or IP of the Gerrit host.')
+    parser_fetch.add_argument('project', action='store',
+                              help='project to scrape info for.')
+    parser_fetch.add_argument('--database', dest='database', action='store',
+                              help='Database file to use.')
+    parser_fetch.add_argument('--port', dest='port', type=int, action='store',
+                              help='Port for the SSH api.')
+    parser_fetch.add_argument('--user', dest='user', action='store',
+                              help='User-name to use when logging in.')
+    parser_fetch.add_argument('--pkey', dest='pkey', action='store',
+                              help='RSA Public key location.')
+
+    parser_query = subparsers.add_parser("query")
+    parser_query.add_argument('database', action='store',
+                              help='Database file to use.')
+    parser_query.add_argument('file', action='store',
+                              type=argparse.FileType('r'),
+                              help='File containing the query.')
+    parser_query.add_argument('parameters', nargs='*',
+                              default=[],
+                              help='Query parameters in the format of '
+                                   'key=value.')
+    parser_query.add_argument('-o --output', dest='output',
+                              type=argparse.FileType('w'),
+                              default=sys.stdout,
+                              help='CSV output file location.')
+
+    args = parser.parse_args()
+    if args.action == "fetch":
+        if args.port is None:
+            args.port = DEFAULT_PORT
+
+        if args.user is None:
+            args.user = pwd.getpwuid(os.getuid()).pw_name
+
+        if args.pkey is None:
+            args.pkey = DEFAULT_KEY_FILE
+
+        if args.database is None:
+            args.database = "gerrit-%s.db" % (args.project,)
+
+    return args
+
+
+def read_settings(conn):
+    c = conn.cursor()
+    c.execute("""SELECT name, value FROM settings""")
+    settings = {}
+    row = c.fetchone()
+    while row is not None:
+        settings[row[0]] = row[1]
+        row = c.fetchone()
+
+    return settings
+
+
+def update_settings(conn, settings):
+    c = conn.cursor()
+    for k, v in settings.iteritems():
+        c.execute("""REPLACE INTO SETTINGS
+                        (name, value)
+                     VALUES
+                        (?, ?)""", (k, v))
+
+
+def fetch(args):
+    conn = sqlite3.connect(args.database)
+    create_schema(conn)
+    settings = read_settings(conn)
+    project = args.project
+    lupdate_key = 'last_update-%s' % (project,)
+    last_update = settings.get(lupdate_key, 0)
+    last_change = last_update
+
+    pkey = paramiko.RSAKey(filename=args.pkey)
+    username = args.user
+    host = args.host
+    port = args.port
+
+    g = Gerrit(host, port, username, pkey)
+    sortKey = 0
+    while sortKey is not None:
+        if sortKey == 0:
+            sortKey = None
+        changes = g.query("project:\"%s\"" % (project,),
+                          options=[QueryOptions.AllApprovals,
+                                   QueryOptions.Comments,
+                                   QueryOptions.CommitMessage,
+                                   QueryOptions.CurrentPatchSet,
+                                   QueryOptions.Dependencies,
+                                   QueryOptions.Files],
+                          resume_sortkey=sortKey)
+        sortKey = None
+        for change in changes:
+            if change['lastUpdated'] > last_update:
+                last_change = max(change['lastUpdated'], last_change)
+                print change['id'], change['number'], change['project']
+                insert_change(conn, change)
+            else:
+                sortKey = None
+                break
+            sortKey = change['sortKey']
+
+        conn.commit()
+        print "Finished Batch"
+
+        settings[lupdate_key] = last_change
+        last_update = last_change
+        update_settings(conn, settings)
+        conn.commit()
+
+
+def process_row(row):
+    nrow = []
+    for i, item in enumerate(row):
+        item = (item.encode('utf-8') if isinstance(item, unicode) else item)
+
+        nrow.append(item)
+
+    return nrow
+
+
+def query(args):
+    conn = sqlite3.connect(args.database)
+    conn.row_factory = sqlite3.Row
+    params = {}
+    for param in args.parameters:
+        k, v = param.split("=", 1)
+        params[k] = v
+
+    q = args.file.read()
+    c = conn.cursor()
+    c.execute(q, params)
+    with args.output:
+        writer = csv.writer(args.output)
+        row = c.fetchone()
+        if row is not None:
+            writer.writerow(process_row(row.keys()))
+        while row is not None:
+            writer.writerow(process_row(row))
+            row = c.fetchone()
+
+
+def main():
+    args = parse_args()
+    if args.action == "fetch":
+        fetch(args)
+
+    if args.action == "query":
+        query(args)
+
+
+if __name__ == "__main__":
+    main()
