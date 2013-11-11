@@ -9,6 +9,8 @@ SELECT 	accounts.name,
 	case when comments_written then comments_written else 0 end as "comments written",
 	case when changes_reviewed then changes_reviewed else 0 end as "changes reviewed",
 	changes_reviewed_ids as "changes reviewed (IDs)",
+	case when reviewers then reviewers else 0 end as "reviewers",
+	reviwers_emails as "reviewer names",
 	case when plus_ones then plus_ones else 0 end as "CR+1",
 	case when plus_twos then plus_twos else 0 end as "CR+2",
 	case when minus_ones then minus_ones else 0 end as "CR-1",
@@ -33,13 +35,22 @@ FROM emails INNER JOIN accounts ON emails.username = accounts.username INNER JOI
 	 WHERE datetime(timestamp, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end)
 	 GROUP BY reviewer) AS messagesPosted ON messagesPosted.reviewer = emails.email
 	LEFT OUTER JOIN
+	(SELECT owner,
+		group_concat(DISTINCT case when reviewer != master_changes.owner then accounts.name end) as reviwers_emails,
+                count(DISTINCT case when reviewer != master_changes.owner then reviewer end) as reviewers
+	 FROM messages INNER JOIN master_changes on messages.change_num = master_changes.number
+	      INNER JOIN emails on emails.email = reviewer INNER JOIN accounts on emails.username = accounts.username
+	 WHERE email != "unknown" and datetime(timestamp, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end)
+	 GROUP BY master_changes.owner) AS changeReviewers ON changeReviewers.owner = emails.email
+	LEFT OUTER JOIN
 	(SELECT reviewer, count(case when label_value = "+1" then 1 end) AS plus_ones,
 		          count(case when label_value = "+2" then 1 end) AS plus_twos,
 		          count(case when label_value = "-1" then 1 end) AS minus_ones,
 		          count(case when label_value = "-2" then 1 end) AS minus_twos
 	 FROM (SELECT DISTINCT reviewer, change_num, label_name, label_value
-               FROM messages inner join labels ON messages.message_id = labels.message_id
-               WHERE datetime(timestamp, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end)
+               FROM messages inner join labels ON messages.message_id = labels.message_id INNER JOIN master_changes ON master_changes.number = messages.change_num
+               WHERE datetime(timestamp, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end) and reviewer != master_changes.owner
          )
 	 WHERE label_name = "Code-Review"
          GROUP BY reviewer) labelSummery ON labelSummery.reviewer = emails.email
+
