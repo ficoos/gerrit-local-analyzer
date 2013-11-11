@@ -23,24 +23,25 @@ FROM emails INNER JOIN accounts ON emails.username = accounts.username INNER JOI
                 group_concat(case when datetime(master_changes.created_on, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end) then number end, ", ") AS changes_opened_ids,
                 group_concat(case when datetime(master_changes.closed_at, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end) AND status = "ABANDONED" then number end, ", ") AS changes_abandoned_ids,
 	        group_concat(case when datetime(master_changes.closed_at, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end) AND status = "MERGED" then number end, ", ") AS changes_merged_ids
-	 FROM master_changes
-	 WHERE datetime(master_changes.created_on, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end) OR
-	       datetime(master_changes.closed_at, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end)
+	 FROM master_changes inner join branches on branches.branch_id = master_changes.branch_id
+	 WHERE (datetime(master_changes.created_on, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end) OR
+	       datetime(master_changes.closed_at, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end)) and
+               (:project = "" or project = :project)
 	 GROUP BY owner) AS changes_stats ON changes_stats.owner = emails.email
 	LEFT OUTER JOIN
 	(SELECT reviewer, count(*) AS messages_posted, sum(comment_num) AS comments_written,
                 group_concat(DISTINCT case when reviewer != master_changes.owner then messages.change_num end) as changes_reviewed_ids,
 		count(DISTINCT case when reviewer != master_changes.owner then messages.change_num end) as changes_reviewed
-	 FROM messages INNER JOIN master_changes on messages.change_num = master_changes.number
-	 WHERE datetime(timestamp, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end)
+	 FROM messages INNER JOIN master_changes on messages.change_num = master_changes.number inner join branches on branches.branch_id = master_changes.branch_id
+	 WHERE datetime(timestamp, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end) and (:project = "" or project = :project)
 	 GROUP BY reviewer) AS messagesPosted ON messagesPosted.reviewer = emails.email
 	LEFT OUTER JOIN
 	(SELECT owner,
 		group_concat(DISTINCT case when reviewer != master_changes.owner then accounts.name end) as reviwers_emails,
                 count(DISTINCT case when reviewer != master_changes.owner then reviewer end) as reviewers
-	 FROM messages INNER JOIN master_changes on messages.change_num = master_changes.number
+	 FROM messages INNER JOIN master_changes on messages.change_num = master_changes.number inner join branches on branches.branch_id = master_changes.branch_id
 	      INNER JOIN emails on emails.email = reviewer INNER JOIN accounts on emails.username = accounts.username
-	 WHERE email != "unknown" and datetime(timestamp, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end)
+	 WHERE email != "unknown" and datetime(timestamp, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end) and (:project = "" or project = :project)
 	 GROUP BY master_changes.owner) AS changeReviewers ON changeReviewers.owner = emails.email
 	LEFT OUTER JOIN
 	(SELECT reviewer, count(case when label_value = "+1" then 1 end) AS plus_ones,
@@ -49,7 +50,8 @@ FROM emails INNER JOIN accounts ON emails.username = accounts.username INNER JOI
 		          count(case when label_value = "-2" then 1 end) AS minus_twos
 	 FROM (SELECT DISTINCT reviewer, change_num, label_name, label_value
                FROM messages inner join labels ON messages.message_id = labels.message_id INNER JOIN master_changes ON master_changes.number = messages.change_num
-               WHERE datetime(timestamp, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end) and reviewer != master_changes.owner
+                    inner join branches on branches.branch_id = master_changes.branch_id
+               WHERE datetime(timestamp, 'unixepoch') BETWEEN datetime(:start) AND datetime(:end) and reviewer != master_changes.owner and (:project = "" or project = :project)
          )
 	 WHERE label_name = "Code-Review"
          GROUP BY reviewer) labelSummery ON labelSummery.reviewer = emails.email
